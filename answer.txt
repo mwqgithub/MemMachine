@@ -1,0 +1,155 @@
+{"id":"resp_0a22087239bc893a006916f1b6219c819494f2318b8ec92d2b","model":"gpt-5-pro","object":"response","output":[{"id":"rs_0a22087239bc893a006916f2c7b2088194aa6f2b26568209dc","type":"reasoning","summary":[]},{"id":"msg_0a22087239bc893a006916f2c7b4108194b99fe96c945bce08","role":"assistant","type":"message","content":[{"type":"output_text","text":"下面是一个在 GitHub Actions 的 Windows Runner 上用 bash 执行的脚本，它会无交互地安装并配置 PostgreSQL 16、从源码构建并安装 pgvector，然后创建目标数据库并启用扩展。无需 GUI、无需 Docker，使用 Chocolatey/winget。可直接在 windows-latest 运行器的 shell: bash 步骤中执行。
+
+说明要点
+- 安装 PostgreSQL 16（通过 Chocolatey，静默安装），并以指定参数重新初始化集簇（编码/Collate/CType）。
+- 注意：Chocolatey 参数 /Password 是用于 Windows 服务账户（本地“postgres”用户）的密码，不是数据库用户密码。脚本会单独为数据库超级用户设置密码。
+- 构建 pgvector 使用 VS 构建工具（GitHub Windows runner 通常已预装 Visual Studio；若缺失则用 winget 静默装 VS 2022 Build Tools）。
+- 使用 MSVC 的 nmake 和 Makefile.win 构建并 nmake install 安装扩展。
+- 创建数据库和扩展，默认用户/密码/库与您给的 Docker 环境一致，可通过环境变量覆盖。
+
+脚本
+将以下内容保存为 scripts/setup-postgres-pgvector-win.sh，并在 GitHub Actions 步骤中执行该脚本。
+
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ----------------------------
+# Config (override via env)
+# ----------------------------
+PG_VERSION=\"${PG_VERSION:-16}\"
+POSTGRES_USER=\"${POSTGRES_USER:-memmachine}\"          # DB 超级用户（对应 docker 的 POSTGRES_USER）
+POSTGRES_PASSWORD=\"${POSTGRES_PASSWORD:-mammachine_password}\" # DB 超级用户密码（对应 docker 的 POSTGRES_PASSWORD）
+POSTGRES_DB=\"${POSTGRES_DB:-memmachine}\"              # 目标数据库（对应 docker 的 POSTGRES_DB）
+POSTGRES_PORT=\"${POSTGRES_PORT:-5432}\"
+
+# initdb 参数（对应 docker 的 POSTGRES_INITDB_ARGS）
+POSTGRES_INITDB_ARGS=\"${POSTGRES_INITDB_ARGS:---encoding=UTF8 --lc-collate=C --lc-ctype=C}\"
+
+# Windows 服务账户（本地用户“postgres”）的密码：必须满足 Windows 复杂性策略
+PG_SERVICE_PASSWORD=\"${PG_SERVICE_PASSWORD:-P0stgresSvc!234}\"
+
+# pgvector 版本（tag）
+PGVECTOR_VERSION=\"${PGVECTOR_VERSION:-v0.7.4}\"
+
+# ----------------------------
+# Paths (Windows format)
+# ----------------------------
+PG_ROOT=\"C:\\\\Program Files\\\\PostgreSQL\\\\${PG_VERSION}\"
+PG_BIN=\"${PG_ROOT}\\\\bin\"
+PG_DATA=\"${PG_ROOT}\\\\data\"
+PG_SERVICE_NAME=\"postgresql-x64-${PG_VERSION}\"
+
+# Helpers
+ps() {
+  powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$@\"
+}
+
+# Convert MSYS path to Windows path
+to_win() {
+  cygpath -w \"$1\"
+}
+
+echo \"[1/7] Installing PostgreSQL ${PG_VERSION} (if missing) via Chocolatey...\"
+if [ ! -x \"/c/Program Files/PostgreSQL/${PG_VERSION}/bin/psql.exe\" ]; then
+  choco install \"postgresql${PG_VERSION}\" -y --no-progress --params \"'/Password:${PG_SERVICE_PASSWORD} /Port:${POSTGRES_PORT}'\"
+fi
+
+echo \"[2/7] Stopping PostgreSQL service and re-initializing cluster with desired locale/encoding...\"
+# Stop service if exists/running
+ps \"if (Get-Service -Name '${PG_SERVICE_NAME}' -ErrorAction SilentlyContinue) { if ((Get-Service -Name '${PG_SERVICE_NAME}').Status -ne 'Stopped') { Stop-Service -Name '${PG_SERVICE_NAME}' -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 3 } }\"
+
+# Ensure data dir recreated
+ps \"if (Test-Path '${PG_DATA}') { Remove-Item -LiteralPath '${PG_DATA}' -Recurse -Force -ErrorAction SilentlyContinue } ; New-Item -ItemType Directory -Path '${PG_DATA}' -Force | Out-Null\"
+
+# pwfile for initdb
+PWFILE=\"$(mktemp)\"
+printf \"%s\" \"$POSTGRES_PASSWORD\" > \"$PWFILE\"
+PWFILE_WIN=\"$(to_win \"$PWFILE\")\"
+
+# Run initdb: set DB superuser to POSTGRES_USER and password via --pwfile
+ps \"\\\"${PG_BIN}\\\\initdb.exe\\\" -D \\\"${PG_DATA}\\\" -U \\\"${POSTGRES_USER}\\\" -A scram-sha-256 --pwfile=\\\"${PWFILE_WIN}\\\" ${POSTGRES_INITDB_ARGS}\"
+
+# Update postgresql.conf (listen + port)
+ps \"\\$conf = '${PG_DATA}\\\\postgresql.conf'; Add-Content -Path \\$conf -Value \\\"`nlisten_addresses = '127.0.0.1'`nport = ${POSTGRES_PORT}`n\\\"\"
+
+# Ensure pg_hba.conf allows local scram
+ps \"\\$hba = '${PG_DATA}\\\\pg_hba.conf'; Add-Content -Path \\$hba -Value \\\"`nhost all all 127.0.0.1/32 scram-sha-256`nhost all all ::1/128 scram-sha-256`n\\\"\"
+
+# Ensure service account has full control on data dir
+echo \"[3/7] Granting service account access to data directory...\"
+ps \"\\$svc = Get-WmiObject Win32_Service -Filter \\\"Name='${PG_SERVICE_NAME}'\\\"; if (\\$svc -ne \\$null) { \\$acct = \\$svc.StartName; icacls '${PG_DATA}' /T /grant \\\"\\$acct:(OI)(CI)F\\\" | Out-Null }\"
+
+echo \"[4/7] Starting PostgreSQL service...\"
+ps \"Start-Service -Name '${PG_SERVICE_NAME}'\"
+
+# Wait for readiness
+echo \"Waiting for PostgreSQL to become ready...\"
+for i in $(seq 1 60); do
+  if \"/c/Program Files/PostgreSQL/${PG_VERSION}/bin/pg_isready.exe\" -h 127.0.0.1 -p \"${POSTGRES_PORT}\" -U \"${POSTGRES_USER}\" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+# Create database if not exists
+echo \"[5/7] Creating database ${POSTGRES_DB} (if not exists)...\"
+export PGPASSWORD=\"${POSTGRES_PASSWORD}\"
+\"/c/Program Files/PostgreSQL/${PG_VERSION}/bin/psql.exe\" -h 127.0.0.1 -p \"${POSTGRES_PORT}\" -U \"${POSTGRES_USER}\" -d postgres -v ON_ERROR_STOP=1 -c \"DO \\$\\$BEGIN IF NOT EXISTS (SELECT FROM pg_database WHERE datname='${POSTGRES_DB}') THEN PERFORM dblink_exec('dbname='''||current_database()||'''','CREATE DATABASE ${POSTGRES_DB}'); END IF; EXCEPTION WHEN undefined_function THEN EXECUTE 'CREATE DATABASE ${POSTGRES_DB}'; END;\\$\\$;\" || true
+# 上面兼容无 dblink 的情况；若失败则尝试普通 createdb
+\"/c/Program Files/PostgreSQL/${PG_VERSION}/bin/createdb.exe\" -h 127.0.0.1 -p \"${POSTGRES_PORT}\" -U \"${POSTGRES_USER}\" \"${POSTGRES_DB}\" 2>/dev/null || true
+
+echo \"[6/7] Installing pgvector (${PGVECTOR_VERSION})...\"
+# If already installed, skip build
+if [ -f \"/c/Program Files/PostgreSQL/${PG_VERSION}/share/extension/vector.control\" ]; then
+  echo \"pgvector extension files already present. Skipping build.\"
+else
+  # Ensure VS Build Tools available (for nmake/MSVC). On GitHub runners typically present.
+  VSWHERE_WIN=\"C:\\\\Program Files (x86)\\\\Microsoft Visual Studio\\\\Installer\\\\vswhere.exe\"
+  if [ ! -f \"/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe\" ]; then
+    echo \"vswhere not found; installing Visual Studio 2022 Build Tools via winget...\"
+    winget install -e --id Microsoft.VisualStudio.2022.BuildTools --silent --accept-source-agreements --accept-package-agreements --override \"--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive --norestart\"
+  fi
+
+  # Locate VsDevCmd
+  VS_INSTALL_PATH=\"$(ps \"& '${VSWHERE_WIN}' -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath\" | tr -d '\\r')\"
+  VSDEV=\"${VS_INSTALL_PATH}\\\\Common7\\\\Tools\\\\VsDevCmd.bat\"
+
+  # Clone pgvector
+  SRC_DIR=\"$(mktemp -d)\"
+  git clone --depth 1 --branch \"${PGVECTOR_VERSION}\" https://github.com/pgvector/pgvector.git \"${SRC_DIR}\"
+  SRC_DIR_WIN=\"$(to_win \"${SRC_DIR}\")\"
+
+  # Build and install with nmake (Makefile.win). Ensure pg_config/bin on PATH.
+  echo \"Building pgvector from source...\"
+  CMD=\"\\\"${VSDEV}\\\" -no_logo -arch=x64 -host_arch=x64 && set \\\"PATH=${PG_BIN};%PATH%\\\" && cd /d \\\"${SRC_DIR_WIN}\\\" && nmake /f Makefile.win clean && nmake /f Makefile.win && nmake /f Makefile.win install\"
+  cmd.exe /d /s /c \"$CMD\"
+fi
+
+echo \"[7/7] Enabling pgvector extension in database ${POSTGRES_DB}...\"
+\"/c/Program Files/PostgreSQL/${PG_VERSION}/bin/psql.exe\" -h 127.0.0.1 -p \"${POSTGRES_PORT}\" -U \"${POSTGRES_USER}\" -d \"${POSTGRES_DB}\" -v ON_ERROR_STOP=1 -c \"CREATE EXTENSION IF NOT EXISTS vector;\"
+
+echo \"Done. PostgreSQL ${PG_VERSION} with pgvector is ready on port ${POSTGRES_PORT}.\"
+echo \"User: ${POSTGRES_USER}, DB: ${POSTGRES_DB}\"
+
+使用方式（GitHub Actions 示例）
+- 运行器：windows-latest
+- Shell：bash
+
+示例 step:
+- name: Setup PostgreSQL with pgvector (Windows)
+  shell: bash
+  run: |
+    chmod +x scripts/setup-postgres-pgvector-win.sh
+    # 可根据需要覆盖环境变量
+    PG_VERSION=16 \\
+    POSTGRES_USER=memmachine \\
+    POSTGRES_PASSWORD=mammachine_password \\
+    POSTGRES_DB=memmachine \\
+    POSTGRES_INITDB_ARGS=\"--encoding=UTF8 --lc-collate=C --lc-ctype=C\" \\
+    PG_SERVICE_PASSWORD=\"P0stgresSvc!234\" \\
+    PGVECTOR_VERSION=\"v0.7.4\" \\
+    ./scripts/setup-postgres-pgvector-win.sh
+\n备注
+- 如果你需要不同版本的 PostgreSQL，将 PG_VERSION 和 Chocolatey 包名一起调整（postgresql15 等）。
+- 如果你的 Windows 策略需要复杂密码，请修改 PG_SERVICE_PASSWORD 确保通过策略检查。
+- 脚本默认只监听本机 127.0.0.1。如需网络访问，请调整 postgresql.conf 的 listen_addresses 和 pg_hba.conf。","annotations":[],"logprobs":[]}],"status":"completed"}],"reasoning":{"effort":"high"},"status":"completed","temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tools":[],"truncation":"disabled","usage":{"total_tokens":12816,"input_tokens":191,"output_tokens":12625,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":10240}},"created_at":1763111350,"parallel_tool_calls":true,"tool_choice":"auto","top_logprobs":0,"top_p":1.0}

@@ -1,0 +1,422 @@
+# .github/workflows/windows-test.yml
+
+name: Installation Test
+
+# on:
+#   push:
+#     branches: [ main ]
+#   pull_request:
+    # branches: [ main ]
+on:
+  push:
+    branches:
+      - installation-script-2
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-python.yml
+    with:
+      python-version: "3.12"
+
+  check-linux:
+    needs: build
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: memmachine
+          POSTGRES_PASSWORD: mammachine_password
+          POSTGRES_DB: memmachine
+          POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U memmachine"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      ollama:
+        image: ollama/ollama
+        ports:
+          - 11434:11434
+
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-dist
+
+      - name: Set up ollama
+        run: |
+          set -eo pipefail
+          until curl -s http://localhost:11434/ > /dev/null; do
+            echo "Ollama not up yet, sleeping..."
+            sleep 1
+          done
+
+          echo "Ollama is up, loading model..."
+          curl http://localhost:11434/api/pull -d '{
+            "name": "qwen3:0.6b"
+          }' -v
+          echo "pulled model qwen3:0.6b into ollama"
+
+          curl http://localhost:11434/api/pull -d '{
+            "name": "nomic-embed-text"
+          }' -v
+          echo "pulled model nomic-embed-text into ollama"
+
+      - name: Test install on Ubuntu
+        run: |
+          set -eo pipefail
+          whl_name=$(ls *.whl)
+          echo "Installing wheel file: $whl_name"
+          python -m pip install $whl_name
+          echo "configuring memmachine"
+          memmachine-configure << EOF
+          y
+          CPU
+          Ollama
+          qwen3:0.6b
+          nomic-embed-text
+          localhost
+          5432
+          memmachine
+          mammachine_password
+          memmachine
+          http://localhost:11434/v1
+          localhost
+          8080
+          EOF
+
+          memmachine-nltk-setup
+          memmachine-sync-profile-schema
+
+          memmachine-server &
+          server_pid=$!
+          sleep 5
+
+          curl -f http://127.0.0.1:8080/v1/sessions
+
+        shell: bash
+
+  check-windows:
+    needs: build
+    runs-on: windows-latest
+
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-dist
+
+      - name: Set up MSVC build tools
+        uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: x64
+
+      - name: 2. Install and Configure pgvector
+        shell: bash # 确保在Bash环境中执行
+        run: |
+          set -e
+          set -x
+
+          # --- 1. 安装 PostgreSQL 16 ---
+          echo "Installing PostgreSQL 16 using Chocolatey..."
+          powershell.exe -Command "choco install postgresql16 --params='/Password:postgres' --yes"
+          
+          # --- 2. 配置路径 ---
+          export PG_VERSION="16"
+          export PG_USER="memmachine"
+          export PG_PASSWORD="mammachine_password"
+          export PG_DB="memmachine"
+          
+          export PG_DEFAULT_USER="postgres"
+          export PGPASSWORD="postgres" 
+          
+          export PG_DIR="C:/Program Files/PostgreSQL/${PG_VERSION}"
+          export PG_BIN_PATH="${PG_DIR}/bin"
+          
+          if [ ! -d "${PG_DIR}" ]; then
+            echo "ERROR: 'choco install' failed. PostgreSQL not found at ${PG_DIR}"
+            exit 1
+          fi
+          
+          # 【修正点 1A】: 为未来的步骤更新 PATH
+          echo "$PG_BIN_PATH" >> $GITHUB_PATH
+
+          # 【修正点 1B】: 为当前脚本会话更新 PATH
+          # 这将修复 "psql: command not found"
+          export PATH="$PG_BIN_PATH:$PATH"
+          echo "PATH is now: $PATH"
+
+          # --- 3. 启动 PostgreSQL ---
+          echo "=== 3. Ensuring PostgreSQL ${PG_VERSION} service is running ==="
+          sc.exe start postgresql-x64-${PG_VERSION} || echo "Service start command finished (it may have already been running)."
+
+          # --- 4. 等待 PostgreSQL 准备就绪 ---
+          echo "Waiting for PostgreSQL to be ready..."
+          timeout=60
+          until pg_isready -U ${PG_DEFAULT_USER} -q || [ $timeout -eq 0 ]; do
+            echo "Waiting... ($timeout)"
+            sleep 1
+            ((timeout--))
+          done
+
+          if [ $timeout -eq 0 ]; then
+            echo "ERROR: PostgreSQL did not become ready."
+            powershell.exe -Command "Get-Content -Path \"${PG_DIR}/data/log/postgresql.log\" -Tail 20"
+            exit 1
+          fi
+          echo "PostgreSQL is ready."
+
+          # --- 5. 创建用户和数据库 ---
+          # 'psql' 和 'createdb' 现在可以被找到了
+          psql -U ${PG_DEFAULT_USER} -c "CREATE USER ${PG_USER} WITH SUPERUSER PASSWORD '${PG_PASSWORD}';" || echo "User ${PG_USER} may already exist."
+          createdb -U ${PG_DEFAULT_USER} ${PG_DB} -O ${PG_USER} || echo "Database ${PG_DB} may already exist."
+
+          # --- 6. 克隆并编译 pgvector ---
+          echo "Cloning pgvector..."
+          git clone --branch v0.7.2 https://github.com/pgvector/pgvector.git
+          cd pgvector
+
+          echo "Compiling pgvector with GNU make..."
+          # 【修正点 2】: 使用 'make' (GNU Make) 而不是 'nmake' (Microsoft Make)
+          # 'make' 会使用 'setup-msvc' 提供的 cl.exe 编译器
+          # 'make' 会使用我们添加到 PATH 的 pg_config.exe
+          make -f Makefile.win install
+
+          echo "Build and install complete."
+          cd ..
+
+          # --- 7. 在数据库中启用扩展 ---
+          echo "Enabling vector extension in database ${PG_DB}..."
+          export PGPASSWORD="${PG_PASSWORD}"
+          psql -U ${PG_USER} -d ${PG_DB} -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+          # --- 8. 验证 ---
+          echo "Verifying installation..."
+          psql -U ${PG_USER} -d ${PG_DB} -c "\dx" | grep "vector"
+          if [ $? -ne 0 ]; then
+            echo "ERROR: vector extension not found!"
+            exit 1
+          fi
+
+          echo "SUCCESS: pgvector installed and configured on Windows."
+          
+          # 设置环境变量，以便后续步骤可以使用
+          echo "PGHOST=localhost" >> $GITHUB_ENV
+          echo "PGPORT=5432" >> $GITHUB_ENV
+          echo "PGUSER=${PG_USER}" >> $GITHUB_ENV
+          echo "PGPASSWORD=${PG_PASSWORD}" >> $GITHUB_ENV
+          echo "PGDATABASE=${PG_DB}" >> $GITHUB_ENV
+      # - name: Set up wsl
+      #   run: |
+      #     wsl --set-default-version 2
+      #     wsl --install -d ubuntu-24.04
+
+      # - name: Start PostgreSQL (pgvector) in WSL
+      #   shell: bash
+      #   run: |
+      #     set -eo pipefail
+      #     wsl apt update
+      #     wsl apt install -y docker.io
+      #     wsl service docker start
+
+      #     wsl docker run -d --name postgres \
+      #       -e POSTGRES_USER=memmachine \
+      #       -e POSTGRES_PASSWORD=mammachine_password \
+      #       -e POSTGRES_DB=memmachine \
+      #       -e POSTGRES_INITDB_ARGS="--encoding=UTF-8 --lc-collate=C --lc-ctype=C" \
+      #       --network host \
+      #       --health-cmd="pg_isready -U memmachine" \
+      #       --health-interval=10s \
+      #       --health-timeout=5s \
+      #       --health-retries=5 \
+      #       pgvector/pgvector:pg16 \
+      #       postgres -c listen_addresses='*'
+
+      # - name: test postgresql is ready in WSL
+      #   shell: bash
+      #   run: |
+      #     set -eo pipefail
+      #     wsl docker ps
+      #     # wsl docker exec postgres netstat -tlnp
+      #     wsl apt install -y postgresql-client
+      #     until wsl pg_isready -h localhost -p 5432 -U memmachine; do
+      #       echo "PostgreSQL not up yet, sleeping..."
+      #       sleep 1
+      #     done
+      #     wsl sudo ss -tlnp | grep 5432
+      
+      # - name: check postgreql logs
+      #   shell: bash
+      #   run: |
+      #     set -eo pipefail
+      #     wsl docker logs postgres
+
+      # - name:  izin (Allow) WSL PostgreSQL Port in Windows Firewall
+      #   run: |
+      #     New-NetFirewallRule -DisplayName "WSL PostgreSQL Allow (CI)" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5432
+      #     Set-NetFirewallProfile -Profile Public -Enabled False
+      #   shell: pwsh
+
+      # - name: Set up ollama
+      #   shell: bash
+      #   run: |
+      #     set -eo pipefail
+      #     winget install Ollama.Ollama --accept-source-agreements
+
+      #     until curl -s http://localhost:11434/ > /dev/null; do
+      #       echo "Ollama not up yet, sleeping..."
+      #       sleep 1
+      #     done
+
+      #     echo "Ollama is up, loading model..."
+      #     curl http://localhost:11434/api/pull -d '{
+      #       "name": "qwen3:0.6b"
+      #     }' -v
+      #     echo "pulled model qwen3:0.6b into ollama"
+
+      #     curl http://localhost:11434/api/pull -d '{
+      #       "name": "nomic-embed-text"
+      #     }' -v
+      #     echo "pulled model nomic-embed-text into ollama"
+
+      # - name: Test install on Windows
+      #   run: |
+      #     set -eo pipefail
+      #     export PYTHONUTF8=1
+      #     whl_name=$(ls *.whl)
+      #     echo "Installing wheel file: $whl_name"
+      #     python -m pip install $whl_name
+      #     echo "configuring memmachine"
+      #     memmachine-configure << EOF
+      #     y
+
+      #     CPU
+      #     Ollama
+      #     qwen3:0.6b
+      #     nomic-embed-text
+      #     localhost
+      #     5432
+      #     memmachine
+      #     mammachine_password
+      #     memmachine
+      #     http://localhost:11434/v1
+      #     localhost
+      #     8080
+      #     EOF
+
+      #     python -c "import nltk; nltk.download('punkt')"
+      #     memmachine-nltk-setup
+      #     memmachine-sync-profile-schema
+
+      #     memmachine-server &
+      #     server_pid=$!
+      #     sleep 5
+
+      #     curl -f http://127.0.0.1:8080/v1/sessions
+
+      #   shell: bash
+
+  check-macos:
+    needs: build
+    runs-on: macos-latest
+
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-dist
+
+      - name: Set up postgresql (pgvector) using Homebrew
+        run: |
+          set -eo pipefail
+          brew update
+          brew upgrade
+
+          brew install postgresql@18
+          brew install pgvector
+          rm -rf /opt/homebrew/var/postgresql@18
+          "/opt/homebrew/opt/postgresql@18/bin/initdb" -D /opt/homebrew/var/postgresql@18 --encoding=UTF-8 --lc-collate=C --lc-ctype=C
+          brew services start postgresql@18
+
+          export PATH="/opt/homebrew/opt/postgresql@18/bin:$PATH"
+          while ! pg_isready -q; do
+              sleep 1
+          done
+
+          createuser -s memmachine
+          createdb -O memmachine memmachine
+          psql -d postgres -c "ALTER USER memmachine WITH PASSWORD 'mammachine_password';"
+          psql -d memmachine -U memmachine -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+      - name: Set up ollama
+        run: |
+          set -eo pipefail
+          brew install ollama
+          brew services start ollama
+          until curl -s http://localhost:11434/ > /dev/null; do
+            echo "Ollama not up yet, sleeping..."
+            sleep 1
+          done
+
+          echo "Ollama is up, loading model..."
+          curl http://localhost:11434/api/pull -d '{
+            "name": "qwen3:0.6b"
+          }' -v
+          echo "pulled model qwen3:0.6b into ollama"
+
+          curl http://localhost:11434/api/pull -d '{
+            "name": "nomic-embed-text"
+          }' -v
+          echo "pulled model nomic-embed-text into ollama"
+
+      - name: Test install on macOS
+        run: |
+          set -eo pipefail
+          whl_name=$(ls *.whl)
+          echo "Installing wheel file: $whl_name"
+          python -m pip install $whl_name
+          echo "configuring memmachine"
+          memmachine-configure << EOF
+          y
+          CPU
+          OpenAI
+          gpt-4o-mini
+          text-embedding-3-small
+          localhost
+          5432
+          memmachine
+          mammachine_password
+          memmachine
+          sk-test
+          localhost
+          8080
+          EOF
+          memmachine-nltk-setup
+          memmachine-sync-profile-schema
+
+          memmachine-server &
+          server_pid=$!
+          sleep 5
+          curl -f http://127.0.0.1:8080/v1/sessions
+        shell: bash
