@@ -1,0 +1,57 @@
+# .github/workflows/windows-test.yml
+
+name: Installation Test
+
+on:
+  push:
+    branches:
+      - installation-script-2
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-python.yml
+    with:
+      # patch-version: ${{ github.event.release.tag_name }}
+      python-version: '3.12'
+
+  check-vms:
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-dist
+
+      - name: Test install on Windows
+        if: runner.os == 'Windows'
+        run: |
+          echo "Hello from Windows!"
+          echo "---"
+          echo "Verifying OS Version:"
+          (Get-CimInstance -Class Win32_OperatingSystem).Caption
+          $whl_name = Get-ChildItem -Path .\dist\ -Filter "*.whl" | Select-Object -ExpandProperty Name
+          echo "Installing wheel file: $whl_name"
+          python -m pip install .\dist\$whl_name
+          echo "Listing Installed Packages:"
+          python -m pip list
+        shell: pwsh
+
+      # - name: 🍎 Prove I am on macOS
+      #   if: runner.os == 'macOS'
+      #   run: |
+      #     echo "Hello from macOS!"
+      #     echo "---"
+      #     echo "Verifying OS Version:"
+      #     sw_vers
+      #     echo "Listing Current Directory: $(ls)"
+      #   shell: bash
