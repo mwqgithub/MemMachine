@@ -69,6 +69,14 @@ class ResourceManagerImpl:
         ]
 
         await asyncio.gather(*tasks)
+        
+        # Pre-initialize session_data_manager to avoid async context issues
+        if self._session_data_manager is None:
+            database = self._conf.session_manager.database
+            engine = await self._database_manager.async_get_sql_engine(database)
+            self._session_data_manager = SessionDataManagerSQL(engine)
+            # Create database tables if they don't exist
+            await self._session_data_manager.create_tables()
 
     async def close(self) -> None:
         """Close resources and clean up state."""
@@ -82,15 +90,15 @@ class ResourceManagerImpl:
 
     async def get_sql_engine(self, name: str) -> AsyncEngine:
         """Return a SQL engine by name."""
-        return self._database_manager.get_sql_engine(name)
+        return await self._database_manager.async_get_sql_engine(name)
 
     async def get_neo4j_driver(self, name: str) -> AsyncDriver:
         """Return a Neo4j driver by name."""
-        return self._database_manager.get_neo4j_driver(name)
+        return await self._database_manager.async_get_neo4j_driver(name)
 
     async def get_vector_graph_store(self, name: str) -> VectorGraphStore:
         """Return a vector graph store by name."""
-        return self._database_manager.get_vector_graph_store(name)
+        return await self._database_manager.async_get_vector_graph_store(name)
 
     async def get_embedder(self, name: str) -> Embedder:
         """Return an embedder by name."""
@@ -107,11 +115,10 @@ class ResourceManagerImpl:
     @property
     def session_data_manager(self) -> SessionDataManager:
         """Lazy-load the session data manager."""
-        if self._session_data_manager is not None:
-            return self._session_data_manager
-        database = self._conf.session_manager.database
-        engine = self._database_manager.get_sql_engine(database)
-        self._session_data_manager = SessionDataManagerSQL(engine)
+        if self._session_data_manager is None:
+            raise RuntimeError(
+                "session_data_manager must be initialized via build() first"
+            )
         return self._session_data_manager
 
     @property
@@ -127,17 +134,31 @@ class ResourceManagerImpl:
         self._episodic_memory_manager = EpisodicMemoryManager(params)
         return self._episodic_memory_manager
 
-    @property
-    def episode_storage(self) -> EpisodeStorage:
+    async def get_episode_storage(self) -> EpisodeStorage:
         """Lazy-load the episode history storage."""
         if self._episode_storage is not None:
             return self._episode_storage
 
-        conf = self._conf.history_storage
-        engine = self._database_manager.get_sql_engine(conf.database)
+        # Use the same database as session_manager for episode storage
+        database = self._conf.session_manager.database
+        engine = await self._database_manager.async_get_sql_engine(database)
 
         self._episode_storage = SqlAlchemyEpisodeStore(engine)
+        
+        # Create episode store tables if they don't exist
+        from memmachine.episode_store.episode_sqlalchemy_store import BaseEpisodeStore
+        async with engine.begin() as conn:
+            await conn.run_sync(BaseEpisodeStore.metadata.create_all)
 
+        return self._episode_storage
+
+    @property
+    def episode_storage(self) -> EpisodeStorage:
+        """Synchronous property for backward compatibility."""
+        if self._episode_storage is None:
+            raise RuntimeError(
+                "episode_storage must be initialized via get_episode_storage() first"
+            )
         return self._episode_storage
 
     async def get_semantic_manager(self) -> SemanticResourceManager:
@@ -145,11 +166,12 @@ class ResourceManagerImpl:
         if self._semantic_manager is not None:
             return self._semantic_manager
 
+        episode_storage = await self.get_episode_storage()
         self._semantic_manager = SemanticResourceManager(
             semantic_conf=self._conf.semantic_memory,
             prompt_conf=self._conf.prompt,
             resource_manager=self,
-            episode_storage=self.episode_storage,
+            episode_storage=episode_storage,
         )
         return self._semantic_manager
 

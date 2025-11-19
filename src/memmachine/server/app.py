@@ -514,8 +514,9 @@ async def initialize_resource(config_file: str) -> ResourceManagerImpl:
     """
     config = load_config_yml_file(config_file)
     ret = ResourceManagerImpl(config)
+    await ret.build()
     semantic_service = await (
-        await resource_manager.get_semantic_manager()
+        await ret.get_semantic_manager()
     ).get_semantic_service()
     await semantic_service.start()
     return ret
@@ -769,6 +770,7 @@ async def mcp_http_lifespan(application: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(lifespan=mcp_http_lifespan)
 app.mount("/mcp", mcp_app)
+load_v2_api_router(app)
 
 
 @mcp.tool(
@@ -1378,8 +1380,6 @@ async def start() -> None:
     """Run the FastAPI application using uvicorn server."""
     port_num = os.getenv("PORT", "8080")
     host_name = os.getenv("HOST", "0.0.0.0")
-
-    load_v2_api_router(app)
 
     await uvicorn.Server(
         uvicorn.Config(app, host=host_name, port=int(port_num)),
